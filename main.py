@@ -567,3 +567,50 @@ async def webhook(request: Request):
         "zones": len(state["zones"]),
         "daily_plan_sent": state["daily_plan_sent"],
     }
+@app.get("/report")
+def report():
+    conn = get_conn()
+    cur = conn.cursor()
+
+    # Total zones
+    cur.execute("SELECT COUNT(*) as cnt FROM zones")
+    total_zones = cur.fetchone()["cnt"]
+
+    # Active
+    cur.execute("SELECT COUNT(*) as cnt FROM zones WHERE status = 'active'")
+    active_zones = cur.fetchone()["cnt"]
+
+    # Cancelled
+    cur.execute("SELECT COUNT(*) as cnt FROM zones WHERE status = 'cancelled'")
+    cancelled_zones = cur.fetchone()["cnt"]
+
+    # By grade
+    cur.execute("""
+        SELECT grade, COUNT(*) as cnt
+        FROM zones
+        GROUP BY grade
+    """)
+    grade_stats = {row["grade"]: row["cnt"] for row in cur.fetchall()}
+
+    # By direction
+    cur.execute("""
+        SELECT direction, COUNT(*) as cnt
+        FROM zones
+        GROUP BY direction
+    """)
+    direction_stats = {row["direction"]: row["cnt"] for row in cur.fetchall()}
+
+    conn.close()
+
+    activation_rate = 0
+    if total_zones > 0:
+        activation_rate = round(active_zones / total_zones * 100, 2)
+
+    return {
+        "total_zones": total_zones,
+        "active_zones": active_zones,
+        "cancelled_zones": cancelled_zones,
+        "activation_rate_percent": activation_rate,
+        "by_grade": grade_stats,
+        "by_direction": direction_stats,
+    }
