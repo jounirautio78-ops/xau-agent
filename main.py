@@ -2,6 +2,7 @@ from fastapi import FastAPI, Request
 import requests
 import os
 import sqlite3
+import json
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -131,6 +132,30 @@ def init_db():
     )
     """)
 
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS planner_execution_signals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT NOT NULL,
+        zone_id TEXT NOT NULL,
+        action TEXT NOT NULL,
+        symbol TEXT,
+        direction TEXT,
+        tier INTEGER,
+        tier_label TEXT,
+        entry_low REAL,
+        entry_high REAL,
+        sl_price REAL,
+        tp1 REAL,
+        tp2 REAL,
+        tp3 REAL,
+        tp4 REAL,
+        tp5 REAL,
+        suggested_entries INTEGER,
+        status TEXT NOT NULL DEFAULT 'pending',
+        payload_json TEXT
+    )
+    """)
+
     conn.commit()
     conn.close()
 
@@ -149,6 +174,55 @@ def log_event(zone_id, message_type, symbol, direction, status_after, payload_js
         symbol,
         direction,
         status_after,
+        payload_json,
+    ))
+    conn.commit()
+    conn.close()
+
+
+def enqueue_planner_execution_signal(
+    zone_id,
+    action,
+    symbol,
+    direction,
+    tier,
+    tier_label,
+    entry_low,
+    entry_high,
+    sl_price,
+    tp1,
+    tp2,
+    tp3,
+    tp4,
+    tp5,
+    suggested_entries,
+    payload_json
+):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO planner_execution_signals (
+            created_at, zone_id, action, symbol, direction, tier, tier_label,
+            entry_low, entry_high, sl_price, tp1, tp2, tp3, tp4, tp5,
+            suggested_entries, status, payload_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+    """, (
+        now_iso(),
+        zone_id,
+        action,
+        symbol,
+        direction,
+        tier,
+        tier_label,
+        entry_low,
+        entry_high,
+        sl_price,
+        tp1,
+        tp2,
+        tp3,
+        tp4,
+        tp5,
+        suggested_entries,
         payload_json,
     ))
     conn.commit()
@@ -460,7 +534,7 @@ async def webhook(request: Request):
     symbol = clean(data.get("symbol", state["symbol"]))
     direction = clean(data.get("direction", "")).lower()
     zone_id = clean(data.get("zone_id", ""))
-    payload_str = str(data)
+    payload_str = json.dumps(data)
 
     if message_type == "new_zone":
         zone = enrich_zone(data)
@@ -475,6 +549,26 @@ async def webhook(request: Request):
                 status_after="planned",
                 payload_json=payload_str,
             )
+
+            enqueue_planner_execution_signal(
+                zone_id=zone["zone_id"],
+                action="place_zone",
+                symbol=zone["symbol"],
+                direction=zone["direction"],
+                tier=zone["tier"],
+                tier_label=zone["tier_label"],
+                entry_low=zone["entry_low"],
+                entry_high=zone["entry_high"],
+                sl_price=zone["sl_price"],
+                tp1=zone["tp1"],
+                tp2=zone["tp2"],
+                tp3=zone["tp3"],
+                tp4=zone["tp4"],
+                tp5=zone["tp5"],
+                suggested_entries=zone["suggested_entries"],
+                payload_json=json.dumps(zone),
+            )
+
             send_daily_plan_if_needed()
 
     elif message_type == "zone_active":
@@ -546,13 +640,37 @@ async def webhook(request: Request):
                 status_after="cancelled",
                 payload_json=payload_str,
             )
+
+            enqueue_planner_execution_signal(
+                zone_id=matched_zone["zone_id"],
+                action="cancel_zone",
+                symbol=matched_zone["symbol"],
+                direction=matched_zone["direction"],
+                tier=matched_zone["tier"],
+                tier_label=matched_zone["tier_label"],
+                entry_low=matched_zone["entry_low"],
+                entry_high=matched_zone["entry_high"],
+                sl_price=matched_zone["sl_price"],
+                tp1=matched_zone["tp1"],
+                tp2=matched_zone["tp2"],
+                tp3=matched_zone["tp3"],
+                tp4=matched_zone["tp4"],
+                tp5=matched_zone["tp5"],
+                suggested_entries=matched_zone["suggested_entries"],
+                payload_json=json.dumps({
+                    "zone_id": matched_zone["zone_id"],
+                    "reason": reason,
+                    "direction": matched_zone["direction"],
+                    "action": "cancel_zone"
+                }),
+            )
+
             send_telegram_message(
                 f"Cancel {matched_zone['direction'].capitalize()} Zone\n"
                 f"Reason: {reason}"
             )
 
     elif message_type == "debug_ping":
-        # Ei lähetetä Telegramiin debug-spämmiä, mutta voidaan halutessa logata eventti.
         log_event(
             zone_id=None,
             message_type="debug_ping",
@@ -567,24 +685,95 @@ async def webhook(request: Request):
         "zones": len(state["zones"]),
         "daily_plan_sent": state["daily_plan_sent"],
     }
+
+
+@app.get("/next_planner_signal")
+def next_planner_signal():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT *
+        FROM planner_execution_signals
+        WHERE status = 'pending'
+        ORDER BY id ASC
+        LIMIT 1
+    """)
+    row = cur.fetchone()
+    conn.close()
+
+    if not row:
+        return {"status": "empty"}
+
+    return {
+        "status": "ok",
+        "signal": dict(row)
+    }
+
+
+@app.post("/ack_planner_signal/{signal_id}")
+def ack_planner_signal(signal_id: int):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE planner_execution_signals
+        SET status = 'processed'
+        WHERE id = ? AND status = 'pending'
+    """, (signal_id,))
+    conn.commit()
+    updated = cur.rowcount
+    conn.close()
+
+    if updated == 0:
+        return {"status": "not_found_or_already_processed"}
+
+    return {"status": "processed", "signal_id": signal_id}
+
+
+@app.get("/planner_execution_report")
+def planner_execution_report():
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("SELECT COUNT(*) AS cnt FROM planner_execution_signals")
+    total = cur.fetchone()["cnt"]
+
+    cur.execute("SELECT COUNT(*) AS cnt FROM planner_execution_signals WHERE status = 'pending'")
+    pending = cur.fetchone()["cnt"]
+
+    cur.execute("SELECT COUNT(*) AS cnt FROM planner_execution_signals WHERE status = 'processed'")
+    processed = cur.fetchone()["cnt"]
+
+    cur.execute("""
+        SELECT action, COUNT(*) AS cnt
+        FROM planner_execution_signals
+        GROUP BY action
+    """)
+    by_action = {row["action"]: row["cnt"] for row in cur.fetchall()}
+
+    conn.close()
+
+    return {
+        "total_signals": total,
+        "pending_signals": pending,
+        "processed_signals": processed,
+        "by_action": by_action,
+    }
+
+
 @app.get("/report")
 def report():
     conn = get_conn()
     cur = conn.cursor()
 
-    # Total zones
     cur.execute("SELECT COUNT(*) as cnt FROM zones")
     total_zones = cur.fetchone()["cnt"]
 
-    # Active
     cur.execute("SELECT COUNT(*) as cnt FROM zones WHERE status = 'active'")
     active_zones = cur.fetchone()["cnt"]
 
-    # Cancelled
     cur.execute("SELECT COUNT(*) as cnt FROM zones WHERE status = 'cancelled'")
     cancelled_zones = cur.fetchone()["cnt"]
 
-    # By grade
     cur.execute("""
         SELECT grade, COUNT(*) as cnt
         FROM zones
@@ -592,7 +781,6 @@ def report():
     """)
     grade_stats = {row["grade"]: row["cnt"] for row in cur.fetchall()}
 
-    # By direction
     cur.execute("""
         SELECT direction, COUNT(*) as cnt
         FROM zones
