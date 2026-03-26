@@ -3,6 +3,7 @@ import requests
 import os
 import sqlite3
 import json
+import math
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -62,6 +63,10 @@ def now_iso():
 
 
 def send_telegram_message(text: str):
+    if not BOT_TOKEN or not CHAT_ID:
+        print("Telegram skipped: BOT_TOKEN or CHAT_ID missing")
+        return
+
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": CHAT_ID,
@@ -72,7 +77,7 @@ def send_telegram_message(text: str):
 
 
 # =========================
-# SQLite logger
+# SQLite helpers
 # =========================
 def get_conn():
     conn = sqlite3.connect(DB_PATH)
@@ -153,6 +158,86 @@ def init_db():
         suggested_entries INTEGER,
         status TEXT NOT NULL DEFAULT 'pending',
         payload_json TEXT
+    )
+    """)
+
+    # Map v2 tables
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS planner_bias_snapshots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        daily_score REAL,
+        h4_score REAL,
+        h1_score REAL,
+        composite_score REAL,
+        composite_label TEXT,
+        payload_json TEXT,
+        created_at TEXT NOT NULL
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS planner_candidates (
+        candidate_id TEXT PRIMARY KEY,
+        direction TEXT NOT NULL,
+        candidate_type TEXT NOT NULL,
+        timeframe_origin TEXT NOT NULL,
+        entry_low REAL NOT NULL,
+        entry_high REAL NOT NULL,
+        invalidation REAL NOT NULL,
+        target_1 REAL,
+        target_2 REAL,
+        freshness TEXT,
+        status TEXT NOT NULL,
+        score REAL,
+        tier TEXT,
+        bias_alignment TEXT,
+        score_breakdown_json TEXT,
+        notes TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS planner_candidate_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        candidate_id TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        old_status TEXT,
+        new_status TEXT,
+        reason TEXT,
+        payload_json TEXT,
+        created_at TEXT NOT NULL
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS planner_map_state (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        best_sell_1_id TEXT,
+        best_buy_1_id TEXT,
+        updated_at TEXT NOT NULL
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS planner_execution_queue_v2 (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        candidate_id TEXT NOT NULL,
+        action TEXT NOT NULL,
+        symbol TEXT,
+        direction TEXT,
+        entry_low REAL,
+        entry_high REAL,
+        invalidation REAL,
+        target_1 REAL,
+        target_2 REAL,
+        tier TEXT,
+        score REAL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        payload_json TEXT,
+        created_at TEXT NOT NULL,
+        processed_at TEXT
     )
     """)
 
@@ -346,7 +431,7 @@ def get_zone_by_id(zone_id):
 
 
 # =========================
-# Planner logic
+# Planner logic (existing)
 # =========================
 def reset_day_if_needed():
     today = datetime.now(TZ).date().isoformat()
@@ -499,6 +584,529 @@ def send_daily_plan_if_needed():
 
     send_telegram_message("\n".join(parts).strip())
     state["daily_plan_sent"] = True
+
+
+# =========================
+# Planner Map v2 helpers
+# =========================
+def tier_from_score(score: float):
+    if score >= 13:
+        return "A"
+    if score >= 10:
+        return "B"
+    if score >= 7:
+        return "C"
+    return "WEAK"
+
+
+def bias_label_from_score(score: float):
+    if score >= 1.25:
+        return "strong_bullish"
+    if score >= 0.4:
+        return "bullish"
+    if score <= -1.25:
+        return "strong_bearish"
+    if score <= -0.4:
+        return "bearish"
+    return "neutral"
+
+
+def clamp(value, low, high):
+    return max(low, min(high, value))
+
+
+def approx_equal(a, b, tol=3.0):
+    if a is None or b is None:
+        return False
+    return abs(float(a) - float(b)) <= tol
+
+
+def get_or_create_map_state():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM planner_map_state WHERE id = 1")
+    row = cur.fetchone()
+
+    if not row:
+        cur.execute("""
+            INSERT INTO planner_map_state (id, best_sell_1_id, best_buy_1_id, updated_at)
+            VALUES (1, NULL, NULL, ?)
+        """, (now_iso(),))
+        conn.commit()
+        cur.execute("SELECT * FROM planner_map_state WHERE id = 1")
+        row = cur.fetchone()
+
+    conn.close()
+    return dict(row)
+
+
+def save_map_state(best_sell_1_id, best_buy_1_id):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO planner_map_state (id, best_sell_1_id, best_buy_1_id, updated_at)
+        VALUES (1, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            best_sell_1_id=excluded.best_sell_1_id,
+            best_buy_1_id=excluded.best_buy_1_id,
+            updated_at=excluded.updated_at
+    """, (best_sell_1_id, best_buy_1_id, now_iso()))
+    conn.commit()
+    conn.close()
+
+
+def save_bias_snapshot(snapshot: dict):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO planner_bias_snapshots (
+            daily_score, h4_score, h1_score, composite_score,
+            composite_label, payload_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (
+        snapshot["daily_score"],
+        snapshot["h4_score"],
+        snapshot["h1_score"],
+        snapshot["composite_score"],
+        snapshot["composite_label"],
+        json.dumps(snapshot),
+        now_iso(),
+    ))
+    conn.commit()
+    conn.close()
+
+
+def compute_bias_snapshot():
+    daily_map = {
+        "strong_bearish": -2,
+        "bearish": -1,
+        "neutral": 0,
+        "bullish": 1,
+        "strong_bullish": 2,
+    }
+    simple_map = {
+        "bearish": -1,
+        "neutral": 0,
+        "bullish": 1,
+    }
+
+    daily_score = daily_map.get(clean(state["bias"].get("daily_bias"), "neutral").lower(), 0)
+    h4_score = simple_map.get(clean(state["bias"].get("h4"), "neutral").lower(), 0)
+    h1_score = simple_map.get(clean(state["bias"].get("h1"), "neutral").lower(), 0)
+
+    composite_score = round(daily_score * 0.4 + h4_score * 0.35 + h1_score * 0.25, 2)
+    composite_label = bias_label_from_score(composite_score)
+
+    return {
+        "daily_score": daily_score,
+        "h4_score": h4_score,
+        "h1_score": h1_score,
+        "composite_score": composite_score,
+        "composite_label": composite_label,
+        "updated_at": now_iso(),
+    }
+
+
+def candidate_exists(candidate_id: str):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM planner_candidates WHERE candidate_id = ?", (candidate_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row is not None
+
+
+def get_candidate(candidate_id: str):
+    if not candidate_id:
+        return None
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM planner_candidates WHERE candidate_id = ?", (candidate_id,))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return None
+    item = dict(row)
+    try:
+        item["score_breakdown"] = json.loads(item.get("score_breakdown_json") or "{}")
+    except Exception:
+        item["score_breakdown"] = {}
+    return item
+
+
+def get_latest_candidate(direction: str, candidate_type: str):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT *
+        FROM planner_candidates
+        WHERE direction = ? AND candidate_type = ?
+        ORDER BY updated_at DESC
+        LIMIT 1
+    """, (direction, candidate_type))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return None
+    item = dict(row)
+    try:
+        item["score_breakdown"] = json.loads(item.get("score_breakdown_json") or "{}")
+    except Exception:
+        item["score_breakdown"] = {}
+    return item
+
+
+def upsert_candidate(candidate: dict):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO planner_candidates (
+            candidate_id, direction, candidate_type, timeframe_origin,
+            entry_low, entry_high, invalidation, target_1, target_2,
+            freshness, status, score, tier, bias_alignment,
+            score_breakdown_json, notes, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(candidate_id) DO UPDATE SET
+            direction=excluded.direction,
+            candidate_type=excluded.candidate_type,
+            timeframe_origin=excluded.timeframe_origin,
+            entry_low=excluded.entry_low,
+            entry_high=excluded.entry_high,
+            invalidation=excluded.invalidation,
+            target_1=excluded.target_1,
+            target_2=excluded.target_2,
+            freshness=excluded.freshness,
+            status=excluded.status,
+            score=excluded.score,
+            tier=excluded.tier,
+            bias_alignment=excluded.bias_alignment,
+            score_breakdown_json=excluded.score_breakdown_json,
+            notes=excluded.notes,
+            updated_at=excluded.updated_at
+    """, (
+        candidate["candidate_id"],
+        candidate["direction"],
+        candidate["candidate_type"],
+        candidate["timeframe_origin"],
+        candidate["entry_low"],
+        candidate["entry_high"],
+        candidate["invalidation"],
+        candidate.get("target_1"),
+        candidate.get("target_2"),
+        candidate.get("freshness", "fresh"),
+        candidate.get("status", "watch"),
+        candidate.get("score", 0),
+        candidate.get("tier", "UNRATED"),
+        candidate.get("bias_alignment", "neutral"),
+        json.dumps(candidate.get("score_breakdown", {})),
+        candidate.get("notes", ""),
+        candidate.get("created_at", now_iso()),
+        candidate.get("updated_at", now_iso()),
+    ))
+    conn.commit()
+    conn.close()
+
+
+def log_candidate_event(candidate_id, event_type, old_status, new_status, reason="", payload=None):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO planner_candidate_events (
+            candidate_id, event_type, old_status, new_status, reason, payload_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (
+        candidate_id,
+        event_type,
+        old_status,
+        new_status,
+        reason,
+        json.dumps(payload or {}),
+        now_iso(),
+    ))
+    conn.commit()
+    conn.close()
+
+
+def enqueue_execution_delta(candidate: dict, action: str, reason: str = ""):
+    payload = {
+        "candidate_id": candidate["candidate_id"],
+        "action": action,
+        "symbol": state["symbol"],
+        "direction": candidate["direction"],
+        "entry_low": candidate["entry_low"],
+        "entry_high": candidate["entry_high"],
+        "invalidation": candidate["invalidation"],
+        "target_1": candidate.get("target_1"),
+        "target_2": candidate.get("target_2"),
+        "tier": candidate.get("tier"),
+        "score": candidate.get("score"),
+        "candidate_type": candidate.get("candidate_type"),
+        "reason": reason,
+    }
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO planner_execution_queue_v2 (
+            candidate_id, action, symbol, direction, entry_low, entry_high,
+            invalidation, target_1, target_2, tier, score, status,
+            payload_json, created_at, processed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, NULL)
+    """, (
+        candidate["candidate_id"],
+        action,
+        state["symbol"],
+        candidate["direction"],
+        candidate["entry_low"],
+        candidate["entry_high"],
+        candidate["invalidation"],
+        candidate.get("target_1"),
+        candidate.get("target_2"),
+        candidate.get("tier"),
+        candidate.get("score"),
+        json.dumps(payload),
+        now_iso(),
+    ))
+    conn.commit()
+    conn.close()
+    return payload
+
+
+def score_candidate(candidate: dict, bias_snapshot: dict):
+    composite = bias_snapshot["composite_score"]
+    direction = candidate["direction"]
+
+    if direction == "sell":
+        bias_alignment = 3 if composite <= -1.25 else 2 if composite <= -0.4 else 1 if composite < 0.4 else 0
+    else:
+        bias_alignment = 3 if composite >= 1.25 else 2 if composite >= 0.4 else 1 if composite > -0.4 else 0
+
+    width = max(0.0, float(candidate["entry_high"]) - float(candidate["entry_low"]))
+    structure_quality = 3 if width <= 8 else 2 if width <= 15 else 1
+
+    location_quality = 2
+    freshness = 2 if candidate.get("freshness") == "fresh" else 1
+    liquidity_context = 1
+    distance_quality = 2
+
+    total_score = float(bias_alignment + structure_quality + location_quality + freshness + liquidity_context + distance_quality)
+
+    candidate["score_breakdown"] = {
+        "bias_alignment": bias_alignment,
+        "structure_quality": structure_quality,
+        "location_quality": location_quality,
+        "freshness": freshness,
+        "liquidity_context": liquidity_context,
+        "distance_quality": distance_quality,
+    }
+    candidate["score"] = total_score
+    candidate["tier"] = tier_from_score(total_score)
+
+    if bias_alignment >= 2:
+        candidate["bias_alignment"] = "aligned"
+    elif bias_alignment == 1:
+        candidate["bias_alignment"] = "partially_aligned"
+    else:
+        candidate["bias_alignment"] = "counter_bias"
+
+    return candidate
+
+
+def is_candidate_executable(candidate: dict):
+    return candidate.get("tier") in ("A", "B") and candidate.get("freshness") != "stale"
+
+
+def same_candidate(a: dict | None, b: dict | None):
+    if not a or not b:
+        return False
+    return (
+        a.get("direction") == b.get("direction")
+        and a.get("candidate_type") == b.get("candidate_type")
+        and approx_equal(a.get("entry_low"), b.get("entry_low"), 3.0)
+        and approx_equal(a.get("entry_high"), b.get("entry_high"), 3.0)
+        and approx_equal(a.get("invalidation"), b.get("invalidation"), 3.0)
+    )
+
+
+def generate_continuation_sell(bias_snapshot: dict):
+    if bias_snapshot["composite_score"] > -0.4:
+        return None
+
+    sells = [z for z in state["zones"] if z["direction"] == "sell" and z["status"] in ("planned", "active")]
+    if not sells:
+        return None
+
+    sells.sort(key=lambda z: (z["tier"], -z["score"]))
+    z = sells[0]
+    entry_low = float(z["entry_low"])
+    entry_high = float(z["entry_high"])
+
+    return {
+        "candidate_id": f"SELL_CONT_M15_{z['zone_id']}",
+        "direction": "sell",
+        "candidate_type": "continuation_sell",
+        "timeframe_origin": "M15",
+        "entry_low": entry_low,
+        "entry_high": entry_high,
+        "invalidation": float(z["sl_price"]),
+        "target_1": float(z["tp1"]),
+        "target_2": float(z["tp2"]) if z.get("tp2") is not None else float(z["tp1"]),
+        "freshness": "fresh",
+        "status": "watch",
+        "score": 0,
+        "tier": "UNRATED",
+        "bias_alignment": "unknown",
+        "score_breakdown": {},
+        "notes": f"Derived from existing sell zone {z['zone_id']}",
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+    }
+
+
+def generate_continuation_buy(bias_snapshot: dict):
+    if bias_snapshot["composite_score"] < 0.4:
+        return None
+
+    buys = [z for z in state["zones"] if z["direction"] == "buy" and z["status"] in ("planned", "active")]
+    if not buys:
+        return None
+
+    buys.sort(key=lambda z: (z["tier"], -z["score"]))
+    z = buys[0]
+    entry_low = float(z["entry_low"])
+    entry_high = float(z["entry_high"])
+
+    return {
+        "candidate_id": f"BUY_CONT_M15_{z['zone_id']}",
+        "direction": "buy",
+        "candidate_type": "continuation_buy",
+        "timeframe_origin": "M15",
+        "entry_low": entry_low,
+        "entry_high": entry_high,
+        "invalidation": float(z["sl_price"]),
+        "target_1": float(z["tp1"]),
+        "target_2": float(z["tp2"]) if z.get("tp2") is not None else float(z["tp1"]),
+        "freshness": "fresh",
+        "status": "watch",
+        "score": 0,
+        "tier": "UNRATED",
+        "bias_alignment": "unknown",
+        "score_breakdown": {},
+        "notes": f"Derived from existing buy zone {z['zone_id']}",
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+    }
+
+
+def run_planner_map_cycle():
+    bias = compute_bias_snapshot()
+    save_bias_snapshot(bias)
+
+    old_state = get_or_create_map_state()
+    old_best_sell = get_candidate(old_state.get("best_sell_1_id"))
+    old_best_buy = get_candidate(old_state.get("best_buy_1_id"))
+
+    new_sell = generate_continuation_sell(bias)
+    new_buy = generate_continuation_buy(bias)
+
+    if new_sell:
+        if candidate_exists(new_sell["candidate_id"]):
+            existing = get_candidate(new_sell["candidate_id"])
+            new_sell["created_at"] = existing["created_at"]
+        new_sell = score_candidate(new_sell, bias)
+        new_sell["status"] = "armed" if is_candidate_executable(new_sell) else "watch"
+        upsert_candidate(new_sell)
+        log_candidate_event(
+            new_sell["candidate_id"],
+            "candidate_upserted",
+            old_best_sell["status"] if old_best_sell and old_best_sell.get("candidate_id") == new_sell["candidate_id"] else None,
+            new_sell["status"],
+            "planner_map_cycle",
+            new_sell,
+        )
+
+    if new_buy:
+        if candidate_exists(new_buy["candidate_id"]):
+            existing = get_candidate(new_buy["candidate_id"])
+            new_buy["created_at"] = existing["created_at"]
+        new_buy = score_candidate(new_buy, bias)
+        new_buy["status"] = "armed" if is_candidate_executable(new_buy) else "watch"
+        upsert_candidate(new_buy)
+        log_candidate_event(
+            new_buy["candidate_id"],
+            "candidate_upserted",
+            old_best_buy["status"] if old_best_buy and old_best_buy.get("candidate_id") == new_buy["candidate_id"] else None,
+            new_buy["status"],
+            "planner_map_cycle",
+            new_buy,
+        )
+
+    deltas = []
+
+    # sell side
+    if old_best_sell and (not new_sell or not same_candidate(old_best_sell, new_sell)):
+        payload = enqueue_execution_delta(old_best_sell, "cancel_candidate", "replaced_or_missing")
+        deltas.append(payload)
+        log_candidate_event(
+            old_best_sell["candidate_id"],
+            "candidate_cancelled",
+            old_best_sell.get("status"),
+            "cancelled",
+            "replaced_or_missing",
+            old_best_sell,
+        )
+
+    if new_sell and is_candidate_executable(new_sell) and (not old_best_sell or not same_candidate(old_best_sell, new_sell)):
+        payload = enqueue_execution_delta(new_sell, "arm_candidate", "new_or_replacement")
+        deltas.append(payload)
+        log_candidate_event(
+            new_sell["candidate_id"],
+            "candidate_armed",
+            old_best_sell.get("status") if old_best_sell else None,
+            "armed",
+            "new_or_replacement",
+            new_sell,
+        )
+
+    # buy side
+    if old_best_buy and (not new_buy or not same_candidate(old_best_buy, new_buy)):
+        payload = enqueue_execution_delta(old_best_buy, "cancel_candidate", "replaced_or_missing")
+        deltas.append(payload)
+        log_candidate_event(
+            old_best_buy["candidate_id"],
+            "candidate_cancelled",
+            old_best_buy.get("status"),
+            "cancelled",
+            "replaced_or_missing",
+            old_best_buy,
+        )
+
+    if new_buy and is_candidate_executable(new_buy) and (not old_best_buy or not same_candidate(old_best_buy, new_buy)):
+        payload = enqueue_execution_delta(new_buy, "arm_candidate", "new_or_replacement")
+        deltas.append(payload)
+        log_candidate_event(
+            new_buy["candidate_id"],
+            "candidate_armed",
+            old_best_buy.get("status") if old_best_buy else None,
+            "armed",
+            "new_or_replacement",
+            new_buy,
+        )
+
+    save_map_state(
+        new_sell["candidate_id"] if new_sell else None,
+        new_buy["candidate_id"] if new_buy else None,
+    )
+
+    return {
+        "ok": True,
+        "bias": bias,
+        "best_sell_1": new_sell,
+        "best_buy_1": new_buy,
+        "deltas": deltas,
+        "updated_at": now_iso(),
+    }
 
 
 # =========================
@@ -687,6 +1295,9 @@ async def webhook(request: Request):
     }
 
 
+# =========================
+# Existing planner execution endpoints
+# =========================
 @app.get("/next_planner_signal")
 def next_planner_signal():
     conn = get_conn()
@@ -758,6 +1369,145 @@ def planner_execution_report():
         "processed_signals": processed,
         "by_action": by_action,
     }
+
+
+# =========================
+# Planner Map v2 endpoints
+# =========================
+@app.post("/planner_map_cycle")
+def planner_map_cycle():
+    return run_planner_map_cycle()
+
+
+@app.get("/planner_map_state")
+def planner_map_state():
+    state_row = get_or_create_map_state()
+    return {
+        "state": state_row,
+        "best_sell_1": get_candidate(state_row.get("best_sell_1_id")),
+        "best_buy_1": get_candidate(state_row.get("best_buy_1_id")),
+    }
+
+
+@app.get("/planner_map_report")
+def planner_map_report():
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("SELECT COUNT(*) AS cnt FROM planner_bias_snapshots")
+    bias_snapshots = cur.fetchone()["cnt"]
+
+    cur.execute("SELECT COUNT(*) AS cnt FROM planner_candidates")
+    candidates_total = cur.fetchone()["cnt"]
+
+    cur.execute("""
+        SELECT status, COUNT(*) AS cnt
+        FROM planner_candidates
+        GROUP BY status
+    """)
+    by_status = {row["status"]: row["cnt"] for row in cur.fetchall()}
+
+    cur.execute("""
+        SELECT direction, COUNT(*) AS cnt
+        FROM planner_candidates
+        GROUP BY direction
+    """)
+    by_direction = {row["direction"]: row["cnt"] for row in cur.fetchall()}
+
+    cur.execute("""
+        SELECT action, COUNT(*) AS cnt
+        FROM planner_execution_queue_v2
+        GROUP BY action
+    """)
+    queue_by_action = {row["action"]: row["cnt"] for row in cur.fetchall()}
+
+    cur.execute("""
+        SELECT status, COUNT(*) AS cnt
+        FROM planner_execution_queue_v2
+        GROUP BY status
+    """)
+    queue_by_status = {row["status"]: row["cnt"] for row in cur.fetchall()}
+
+    conn.close()
+
+    return {
+        "bias_snapshots": bias_snapshots,
+        "candidates_total": candidates_total,
+        "candidates_by_status": by_status,
+        "candidates_by_direction": by_direction,
+        "queue_v2_by_action": queue_by_action,
+        "queue_v2_by_status": queue_by_status,
+    }
+
+
+@app.get("/next_planner_signal_v2")
+def next_planner_signal_v2():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT *
+        FROM planner_execution_queue_v2
+        WHERE status = 'pending'
+        ORDER BY id ASC
+        LIMIT 1
+    """)
+    row = cur.fetchone()
+    conn.close()
+
+    if not row:
+        return {"status": "empty"}
+
+    item = dict(row)
+    try:
+        item["payload"] = json.loads(item.get("payload_json") or "{}")
+    except Exception:
+        item["payload"] = {}
+
+    return {"status": "ok", "signal": item}
+
+
+@app.post("/ack_planner_signal_v2/{signal_id}")
+def ack_planner_signal_v2(signal_id: int):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE planner_execution_queue_v2
+        SET status = 'processed', processed_at = ?
+        WHERE id = ? AND status = 'pending'
+    """, (now_iso(), signal_id))
+    conn.commit()
+    updated = cur.rowcount
+    conn.close()
+
+    if updated == 0:
+        return {"status": "not_found_or_already_processed"}
+
+    return {"status": "processed", "signal_id": signal_id}
+
+
+@app.get("/planner_candidates")
+def planner_candidates():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT *
+        FROM planner_candidates
+        ORDER BY updated_at DESC
+        LIMIT 50
+    """)
+    rows = cur.fetchall()
+    conn.close()
+
+    items = []
+    for row in rows:
+        item = dict(row)
+        try:
+            item["score_breakdown"] = json.loads(item.get("score_breakdown_json") or "{}")
+        except Exception:
+            item["score_breakdown"] = {}
+        items.append(item)
+
+    return {"items": items}
 
 
 @app.get("/report")
