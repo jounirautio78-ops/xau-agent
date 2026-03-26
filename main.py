@@ -3,7 +3,6 @@ import requests
 import os
 import sqlite3
 import json
-import math
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -425,6 +424,21 @@ def get_zone_by_id(zone_id):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("SELECT * FROM zones WHERE zone_id = ?", (zone_id,))
+    row = cur.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def get_best_zone_from_db(direction: str):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT *
+        FROM zones
+        WHERE direction = ? AND status IN ('planned', 'active')
+        ORDER BY tier ASC, score DESC, updated_at DESC
+        LIMIT 1
+    """, (direction,))
     row = cur.fetchone()
     conn.close()
     return dict(row) if row else None
@@ -885,8 +899,15 @@ def score_candidate(candidate: dict, bias_snapshot: dict):
     width = max(0.0, float(candidate["entry_high"]) - float(candidate["entry_low"]))
     structure_quality = 3 if width <= 8 else 2 if width <= 15 else 1
 
-    location_quality = 2
-    freshness = 2 if candidate.get("freshness") == "fresh" else 1
+    zone_mid = (float(candidate["entry_low"]) + float(candidate["entry_high"])) / 2.0
+    tp1 = float(candidate["target_1"]) if candidate.get("target_1") is not None else zone_mid
+    sl = float(candidate["invalidation"])
+    reward = abs(zone_mid - tp1)
+    risk = abs(sl - zone_mid)
+    rr = reward / risk if risk > 0 else 0
+
+    location_quality = 3 if rr >= 1.8 else 2 if rr >= 1.2 else 1 if rr >= 0.8 else 0
+    freshness = 2 if candidate.get("freshness") == "fresh" else 1 if candidate.get("freshness") == "tested_once" else 0
     liquidity_context = 1
     distance_quality = 2
 
@@ -929,74 +950,43 @@ def same_candidate(a: dict | None, b: dict | None):
     )
 
 
-def generate_continuation_sell(bias_snapshot: dict):
-    if bias_snapshot["composite_score"] > -0.4:
+def zone_to_continuation_candidate(zone: dict, direction: str):
+    if not zone:
         return None
 
-    sells = [z for z in state["zones"] if z["direction"] == "sell" and z["status"] in ("planned", "active")]
-    if not sells:
-        return None
-
-    sells.sort(key=lambda z: (z["tier"], -z["score"]))
-    z = sells[0]
-    entry_low = float(z["entry_low"])
-    entry_high = float(z["entry_high"])
+    created_at = zone.get("created_at") or now_iso()
+    zone_id = zone["zone_id"]
 
     return {
-        "candidate_id": f"SELL_CONT_M15_{z['zone_id']}",
-        "direction": "sell",
-        "candidate_type": "continuation_sell",
+        "candidate_id": f"{direction.upper()}_CONT_M15_{zone_id}",
+        "direction": direction,
+        "candidate_type": f"continuation_{direction}",
         "timeframe_origin": "M15",
-        "entry_low": entry_low,
-        "entry_high": entry_high,
-        "invalidation": float(z["sl_price"]),
-        "target_1": float(z["tp1"]),
-        "target_2": float(z["tp2"]) if z.get("tp2") is not None else float(z["tp1"]),
-        "freshness": "fresh",
+        "entry_low": float(zone["entry_low"]),
+        "entry_high": float(zone["entry_high"]),
+        "invalidation": float(zone["sl_price"]),
+        "target_1": float(zone["tp1"]) if zone.get("tp1") is not None else None,
+        "target_2": float(zone["tp2"]) if zone.get("tp2") is not None else None,
+        "freshness": "fresh" if zone.get("status") == "planned" else "tested_once",
         "status": "watch",
         "score": 0,
         "tier": "UNRATED",
         "bias_alignment": "unknown",
         "score_breakdown": {},
-        "notes": f"Derived from existing sell zone {z['zone_id']}",
-        "created_at": now_iso(),
+        "notes": f"Derived from zone {zone_id}",
+        "created_at": created_at,
         "updated_at": now_iso(),
     }
+
+
+def generate_continuation_sell(bias_snapshot: dict):
+    zone = get_best_zone_from_db("sell")
+    return zone_to_continuation_candidate(zone, "sell")
 
 
 def generate_continuation_buy(bias_snapshot: dict):
-    if bias_snapshot["composite_score"] < 0.4:
-        return None
-
-    buys = [z for z in state["zones"] if z["direction"] == "buy" and z["status"] in ("planned", "active")]
-    if not buys:
-        return None
-
-    buys.sort(key=lambda z: (z["tier"], -z["score"]))
-    z = buys[0]
-    entry_low = float(z["entry_low"])
-    entry_high = float(z["entry_high"])
-
-    return {
-        "candidate_id": f"BUY_CONT_M15_{z['zone_id']}",
-        "direction": "buy",
-        "candidate_type": "continuation_buy",
-        "timeframe_origin": "M15",
-        "entry_low": entry_low,
-        "entry_high": entry_high,
-        "invalidation": float(z["sl_price"]),
-        "target_1": float(z["tp1"]),
-        "target_2": float(z["tp2"]) if z.get("tp2") is not None else float(z["tp1"]),
-        "freshness": "fresh",
-        "status": "watch",
-        "score": 0,
-        "tier": "UNRATED",
-        "bias_alignment": "unknown",
-        "score_breakdown": {},
-        "notes": f"Derived from existing buy zone {z['zone_id']}",
-        "created_at": now_iso(),
-        "updated_at": now_iso(),
-    }
+    zone = get_best_zone_from_db("buy")
+    return zone_to_continuation_candidate(zone, "buy")
 
 
 def run_planner_map_cycle():
