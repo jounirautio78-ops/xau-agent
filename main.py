@@ -1209,7 +1209,7 @@ async def webhook(request: Request):
                 f"Tier: {matched_zone['tier_label']}"
             )
 
-    elif message_type == "zone_cancel":
+       elif message_type == "zone_cancel":
         matched_zone = None
         reason = clean(data.get("reason", "unknown"))
 
@@ -1230,6 +1230,7 @@ async def webhook(request: Request):
 
         if matched_zone:
             update_zone_status(matched_zone["zone_id"], "cancelled", reason)
+
             log_event(
                 zone_id=matched_zone["zone_id"],
                 message_type="zone_cancel",
@@ -1239,6 +1240,7 @@ async def webhook(request: Request):
                 payload_json=payload_str,
             )
 
+            # 🔴 1. CANCEL pending orders
             enqueue_planner_execution_signal(
                 zone_id=matched_zone["zone_id"],
                 action="cancel_zone",
@@ -1255,34 +1257,34 @@ async def webhook(request: Request):
                 tp4=matched_zone["tp4"],
                 tp5=matched_zone["tp5"],
                 suggested_entries=matched_zone["suggested_entries"],
-                payload_json=json.dumps({
-                    "zone_id": matched_zone["zone_id"],
-                    "reason": reason,
-                    "direction": matched_zone["direction"],
-                    "action": "cancel_zone"
-                }),
+                payload_json=payload_str,
+            )
+
+            # 🔴 2. CLOSE open positions
+            enqueue_planner_execution_signal(
+                zone_id=matched_zone["zone_id"],
+                action="close_zone",
+                symbol=matched_zone["symbol"],
+                direction=matched_zone["direction"],
+                tier=matched_zone["tier"],
+                tier_label=matched_zone["tier_label"],
+                entry_low=matched_zone["entry_low"],
+                entry_high=matched_zone["entry_high"],
+                sl_price=matched_zone["sl_price"],
+                tp1=matched_zone["tp1"],
+                tp2=matched_zone["tp2"],
+                tp3=matched_zone["tp3"],
+                tp4=matched_zone["tp4"],
+                tp5=matched_zone["tp5"],
+                suggested_entries=matched_zone["suggested_entries"],
+                payload_json=payload_str,
             )
 
             send_telegram_message(
                 f"Cancel {matched_zone['direction'].capitalize()} Zone\n"
                 f"Reason: {reason}"
             )
-
-    elif message_type == "debug_ping":
-        log_event(
-            zone_id=None,
-            message_type="debug_ping",
-            symbol=symbol,
-            direction=direction,
-            status_after="debug",
-            payload_json=payload_str,
-        )
-
-    return {
-        "ok": True,
-        "zones": len(state["zones"]),
-        "daily_plan_sent": state["daily_plan_sent"],
-    }
+    
 
 
 # =========================
