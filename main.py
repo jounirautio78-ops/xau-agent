@@ -14,6 +14,11 @@ CHAT_ID = os.getenv("CHAT_ID")
 TZ = ZoneInfo("Europe/Madrid")
 DB_PATH = os.getenv("TRADE_LOG_DB", "trade_logger.db")
 
+# Paul v2 filters
+PAUL_BLOCKED_HOURS = {1, 5, 8, 9, 23}
+PAUL_ALLOWED_HOURS = set(range(24)) - PAUL_BLOCKED_HOURS
+STRICT_SELL_GRADES = {"SNIPER"}
+
 state = {
     "date": None,
     "symbol": "XAUUSD",
@@ -462,6 +467,62 @@ def normalize_sl_distance(structural_distance: float):
     return None
 
 
+def current_hour():
+    return datetime.now(TZ).hour
+
+
+def current_bias_snapshot():
+    return {
+        "h4": clean(state["bias"].get("h4"), "neutral").lower(),
+        "h1": clean(state["bias"].get("h1"), "neutral").lower(),
+        "daily_bias": clean(state["bias"].get("daily_bias"), "neutral").lower(),
+    }
+
+
+def hour_allowed_for_paul():
+    return current_hour() in PAUL_ALLOWED_HOURS
+
+
+def buy_allowed_by_bias(bias: dict):
+    return bias["daily_bias"] in ("bullish", "strong_bullish") or (
+        bias["h4"] == "bullish" and bias["h1"] == "bullish"
+    )
+
+
+def sell_allowed_by_bias(bias: dict):
+    return bias["daily_bias"] in ("bearish", "strong_bearish") and (
+        bias["h4"] == "bearish" or bias["h1"] == "bearish"
+    )
+
+
+def zone_width(entry_low: float, entry_high: float):
+    return abs(float(entry_high) - float(entry_low))
+
+
+def paul_v2_filter_reason(direction: str, grade: str, entry_low: float, entry_high: float):
+    bias = current_bias_snapshot()
+
+    if not hour_allowed_for_paul():
+        return f"blocked_hour_{current_hour()}"
+
+    width = zone_width(entry_low, entry_high)
+    if width < 0.5:
+        return f"zone_too_small_{round(width, 3)}"
+    if width > 25:
+        return f"zone_too_wide_{round(width, 3)}"
+
+    if direction == "buy":
+        if not buy_allowed_by_bias(bias):
+            return f"buy_blocked_by_bias_{bias['daily_bias']}_{bias['h4']}_{bias['h1']}"
+    elif direction == "sell":
+        if grade.upper() not in STRICT_SELL_GRADES:
+            return f"sell_grade_too_weak_{grade.upper()}"
+        if not sell_allowed_by_bias(bias):
+            return f"sell_blocked_by_bias_{bias['daily_bias']}_{bias['h4']}_{bias['h1']}"
+
+    return None
+
+
 def map_grade_to_tier(grade: str):
     grade = (grade or "").upper()
     if grade == "SNIPER":
@@ -485,6 +546,11 @@ def enrich_zone(data: dict):
     invalidation = to_float(data.get("invalidation"))
 
     if entry_low is None or entry_high is None or invalidation is None:
+        return None
+
+    filter_reason = paul_v2_filter_reason(direction, grade, entry_low, entry_high)
+    if filter_reason:
+        print(f"PAUL V2 FILTERED: {filter_reason} | direction={direction} | grade={grade}")
         return None
 
     entry_mid = (entry_low + entry_high) / 2.0
@@ -540,7 +606,7 @@ def enrich_zone(data: dict):
         "activation_time": None,
         "cancel_time": None,
         "cancel_reason": None,
-        "notes": None,
+        "notes": "paul_v2",
     }
     return zone
 
@@ -1512,6 +1578,16 @@ def planner_candidates():
         items.append(item)
 
     return {"items": items}
+
+
+@app.get("/paul_v2_settings")
+def paul_v2_settings():
+    return {
+        "blocked_hours": sorted(list(PAUL_BLOCKED_HOURS)),
+        "allowed_hours": sorted(list(PAUL_ALLOWED_HOURS)),
+        "strict_sell_grades": sorted(list(STRICT_SELL_GRADES)),
+        "current_bias": current_bias_snapshot(),
+    }
 
 
 @app.get("/report")
