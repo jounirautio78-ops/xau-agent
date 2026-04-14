@@ -18,6 +18,7 @@ DB_PATH = os.getenv("TRADE_LOG_DB", "trade_logger.db")
 PAUL_BLOCKED_HOURS = {1, 5, 8, 9, 23}
 PAUL_ALLOWED_HOURS = set(range(24)) - PAUL_BLOCKED_HOURS
 STRICT_SELL_GRADES = {"SNIPER"}
+FRESHNESS_TOUCH_TOLERANCE = 0.35
 
 state = {
     "date": None,
@@ -499,6 +500,46 @@ def zone_width(entry_low: float, entry_high: float):
     return abs(float(entry_high) - float(entry_low))
 
 
+def zone_mid(entry_low: float, entry_high: float):
+    return (float(entry_low) + float(entry_high)) / 2.0
+
+
+def zone_is_fresh(direction: str, entry_low: float, entry_high: float):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT direction, entry_low, entry_high, status
+        FROM zones
+        WHERE symbol = ?
+          AND status IN ('planned', 'active', 'cancelled')
+        ORDER BY updated_at DESC
+        LIMIT 200
+    """, (state["symbol"],))
+    rows = cur.fetchall()
+    conn.close()
+
+    low = float(entry_low)
+    high = float(entry_high)
+    mid = zone_mid(low, high)
+
+    for row in rows:
+        row_dir = str(row["direction"] or "").lower()
+        row_low = row["entry_low"]
+        row_high = row["entry_high"]
+
+        if row_dir != direction:
+            continue
+        if row_low is None or row_high is None:
+            continue
+
+        existing_mid = zone_mid(row_low, row_high)
+
+        if abs(existing_mid - mid) <= FRESHNESS_TOUCH_TOLERANCE:
+            return False
+
+    return True
+
+
 def paul_v2_filter_reason(direction: str, grade: str, entry_low: float, entry_high: float):
     bias = current_bias_snapshot()
 
@@ -510,6 +551,9 @@ def paul_v2_filter_reason(direction: str, grade: str, entry_low: float, entry_hi
         return f"zone_too_small_{round(width, 3)}"
     if width > 25:
         return f"zone_too_wide_{round(width, 3)}"
+
+    if not zone_is_fresh(direction, entry_low, entry_high):
+        return "zone_not_fresh"
 
     if direction == "buy":
         if not buy_allowed_by_bias(bias):
@@ -1586,6 +1630,7 @@ def paul_v2_settings():
         "blocked_hours": sorted(list(PAUL_BLOCKED_HOURS)),
         "allowed_hours": sorted(list(PAUL_ALLOWED_HOURS)),
         "strict_sell_grades": sorted(list(STRICT_SELL_GRADES)),
+        "freshness_touch_tolerance": FRESHNESS_TOUCH_TOLERANCE,
         "current_bias": current_bias_snapshot(),
     }
 
